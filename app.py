@@ -12,26 +12,45 @@ def fetch(url):
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.read()
 
-def resolve(watch_url):
-    m = re.search(r"/watch/.+-(\d+)-episode-(\d+)", watch_url)
-    if not m:
-        return None, None, "Invalid URL format"
-    anilist_id, episode = m.group(1), m.group(2)
+def get_anime_id(anilist_id):
+    """Search the AnimeX API for the internal anime_id using AniList ID."""
+    search_url = f"{API}/search?anilistId={anilist_id}"
+    try:
+        data = json.loads(fetch(search_url))
+        # Try direct anilistId lookup first
+        if isinstance(data, dict) and data.get("id"):
+            return data["id"], None
+        if isinstance(data, list) and data:
+            return data[0]["id"], None
+    except Exception:
+        pass
 
-    html = fetch(watch_url).decode("utf-8", errors="replace")
-    aid_m = re.search(rf"animeId\s*:\s*['\"]([^'\"]+)['\"].{{0,200}}?anilistId\s*:\s*{anilist_id}\b", html) \
-         or re.search(rf"anilistId\s*:\s*{anilist_id}\b.{{0,200}}?animeId\s*:\s*['\"]([^'\"]+)['\"]", html)
-    if not aid_m:
-        return None, None, "Could not find anime API ID in page"
-    anime_id = aid_m.group(1)
+    # Fallback: build a watch URL from anilist ID and scrape the page
+    # We need a slug — search by anilist ID via the info endpoint
+    try:
+        info_url = f"{API}/info?anilistId={anilist_id}"
+        data = json.loads(fetch(info_url))
+        anime_id = data.get("id") or data.get("animeId")
+        if anime_id:
+            return anime_id, None
+    except Exception:
+        pass
+
+    return None, "Could not resolve internal anime ID from AniList ID. The site may require a slug-based lookup."
+
+def resolve(anilist_id, episode):
+    anime_id, error = get_anime_id(anilist_id)
+    if error:
+        return None, None, error
 
     servers = json.loads(fetch(f"{API}/servers?id={anime_id}&epNum={episode}"))
-
     streams = []
     for typ, key in (("sub", "subProviders"), ("dub", "dubProviders")):
         for p in servers.get(key, []):
             try:
-                data = json.loads(fetch(f"{API}/sources?id={anime_id}&epNum={episode}&type={typ}&providerId={p['id']}"))
+                data = json.loads(fetch(
+                    f"{API}/sources?id={anime_id}&epNum={episode}&type={typ}&providerId={p['id']}"
+                ))
                 for s in data.get("sources", []):
                     streams.append({
                         "type": typ,
@@ -45,51 +64,50 @@ def resolve(watch_url):
 
     return anime_id, streams, None
 
-
 # --- Streamlit UI ---
 st.set_page_config(page_title="AnimeX Stream Resolver", page_icon="🎬", layout="wide")
 st.title("🎬 AnimeX Stream Resolver")
-st.caption("Resolves animex.one watch URLs to direct HLS stream URLs")
+st.caption("Enter an AniList ID and episode number to get direct HLS stream URLs")
 
-url = st.text_input(
-    "Watch URL",
-    value="https://animex.one/watch/naruto-shippuden-1735-episode-3",
-    placeholder="https://animex.one/watch/<slug>-<id>-episode-<ep>"
-)
+col1, col2 = st.columns([2, 1])
+with col1:
+    anilist_id = st.text_input("AniList ID", value="1735", placeholder="e.g. 1735")
+with col2:
+    episode = st.text_input("Episode", value="3", placeholder="e.g. 3")
 
 if st.button("Resolve Streams", type="primary"):
-    with st.spinner("Fetching streams..."):
-        try:
-            anime_id, streams, error = resolve(url)
-            if error:
-                st.error(error)
-            else:
-                st.success(f"✅ Resolved `{anime_id}`  —  {len(streams)} stream(s) found")
+    if not anilist_id or not episode:
+        st.warning("Please enter both an AniList ID and episode number.")
+    else:
+        with st.spinner("Fetching streams..."):
+            try:
+                anime_id, streams, error = resolve(anilist_id.strip(), episode.strip())
+                if error:
+                    st.error(error)
+                    st.info("💡 Tip: You can find the AniList ID in the URL on anilist.co — e.g. anilist.co/anime/**1735**/Naruto-Shippuden")
+                else:
+                    st.success(f"✅ Resolved `{anime_id}`  —  {len(streams)} stream(s) found")
 
-                # --- raw JSON output (API-style) ---
-                with st.expander("📦 Raw JSON (API response)", expanded=True):
-                    st.json(streams)
+                    with st.expander("📦 Raw JSON (API response)", expanded=True):
+                        st.json(streams)
 
-                st.divider()
+                    st.divider()
 
-                # --- grouped cards ---
-                sub_streams = [s for s in streams if s.get("type") == "sub"]
-                dub_streams = [s for s in streams if s.get("type") == "dub"]
+                    sub_streams = [s for s in streams if s.get("type") == "sub"]
+                    dub_streams = [s for s in streams if s.get("type") == "dub"]
+                    col1, col2 = st.columns(2)
 
-                col1, col2 = st.columns(2)
-
-                for col, group, label in ((col1, sub_streams, "🔤 SUB"), (col2, dub_streams, "🔊 DUB")):
-                    with col:
-                        st.subheader(label)
-                        for s in group:
-                            with st.container(border=True):
-                                if "error" in s:
-                                    st.error(f"**{s['provider']}** — {s['error']}")
-                                else:
-                                    st.markdown(f"**Provider:** `{s['provider']}`")
-                                    st.markdown(f"**Quality:** `{s['quality']}`")
-                                    st.markdown(f"**Type:** `{s['mimetype']}`")
-                                    st.code(s["url"], language=None)
-
-        except Exception as e:
-            st.error(f"Error: {e}")
+                    for col, group, label in ((col1, sub_streams, "🔤 SUB"), (col2, dub_streams, "🔊 DUB")):
+                        with col:
+                            st.subheader(label)
+                            for s in group:
+                                with st.container(border=True):
+                                    if "error" in s:
+                                        st.error(f"**{s['provider']}** — {s['error']}")
+                                    else:
+                                        st.markdown(f"**Provider:** `{s['provider']}`")
+                                        st.markdown(f"**Quality:** `{s['quality']}`")
+                                        st.markdown(f"**Type:** `{s['mimetype']}`")
+                                        st.code(s["url"], language=None)
+            except Exception as e:
+                st.error(f"Error: {e}")
